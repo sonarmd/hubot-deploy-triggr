@@ -14,13 +14,12 @@ const exec = util.promisify(require('child_process').exec);
 const deployScriptPath = '/home/hubot/DeploymentScripts/hubot';
 
 const authorizedSlackUsers = [
-  'deploy-bot',
+  'devops',      // deploy bot
   'avespoli',
   'jlyons',
   'tnguyen',
   'cforrester',
   'vsiqueira',
-  'devops',
 ];
 
 const validApps = ['frontend', 'api'];
