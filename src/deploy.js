@@ -1,61 +1,79 @@
 // Description:
-//   Runs continuous dev deploy based on slack messages
+//   Universal deploy — handles frontend and API deploys via Slack.
 //
 // Commands:
-//   hubot deploy dev - deploys api dev as root
+//   hubot deploy <app> <env> <tag> <artifact_url>
 //
-// Author:
-//   brian lai
+// Examples:
+//   hubot deploy frontend stg stg-fe-0.0.1-b8 https://api.github.com/repos/sonarmd/frontend/releases/tags/stg-fe-0.0.1-b8
+//   hubot deploy api prd prd-api-2.5.1-b45 https://api.github.com/repos/sonarmd/triggr_api/releases/tags/prd-api-2.5.1-b45
 
 const util = require('util');
 const exec = util.promisify(require('child_process').exec);
 
 const deployScriptPath = '/home/hubot/DeploymentScripts/hubot';
-const authorizedSlackUsers = ['avespoli', 'devops', 'jlyons'];
+
+const authorizedSlackUsers = [
+  'devops',      // deploy bot
+  'avespoli',
+  'jlyons',
+  'tnguyen',
+  'cforrester',
+  'vsiqueira',
+];
+
+const validApps = ['frontend', 'api'];
+const validEnvs = ['dev', 'stg', 'prd'];
 
 const os = require('os');
 const hostname = os.hostname();
 const hostEnv = hostname.split(/[-.]/)[1];
 
 module.exports = function(robot) {
-  robot.respond(/deploy (\w+) ([\w-\.]+) (.+)$/i, async (msg) => {
-    let environment = msg.match[1].toLowerCase();
-    let deployTag = msg.match[2].toLowerCase();
-    let artifactUrl = msg.match[3].toLowerCase();
-    
-    // this is a hack because prod doesnt have prd and its expecting 
-    // it to based off this code. I am not dealing with reworking it right now
-    if (environment != hostEnv) {
-      robot.logger.error(`environment mismatch:  ${environment}`);
-      robot.logger.error(`hostEnv: ${hostEnv}`);  
-      if(environment === 'prd' && hostEnv === 'sonarmd'){
-        // prod is sonarmd so dont do anything
-        robot.logger.info(`prod is sonarmd so still deploying`);
+  robot.respond(/deploy (\w+) (\w+) ([\w-\.]+) (.+)$/i, async (msg) => {
+    const app = msg.match[1].toLowerCase();
+    const environment = msg.match[2].toLowerCase();
+    const deployTag = msg.match[3];
+    const artifactUrl = msg.match[4];
+    const caller = msg.message.user.name;
 
+    if (!validApps.includes(app)) {
+      msg.reply(`Unknown app: ${app}. Expected: ${validApps.join(', ')}`);
+      return;
+    }
+
+    if (!validEnvs.includes(environment)) {
+      msg.reply(`Unknown env: ${environment}. Expected: ${validEnvs.join(', ')}`);
+      return;
+    }
+
+    // Check environment matches this host.
+    if (environment !== hostEnv) {
+      if (environment === 'prd' && hostEnv === 'sonarmd') {
+        robot.logger.info('prod host (sonarmd) — proceeding');
       } else {
         return;
       }
     }
-    robot.logger.info(
-      `attempting to deploy ${environment} by user's command, user=${JSON.stringify(msg.message.user)}`
-    );
-    if (msg.message.user.name && !authorizedSlackUsers.includes(msg.message.user.name)) {
-      robot.logger.error(`Unauthorized user ${msg.message.user.name}`);
-      msg.reply(`You don't have the authoritah!!!`);
+
+    if (!caller || !authorizedSlackUsers.includes(caller)) {
+      robot.logger.error(`Unauthorized deploy attempt by ${caller}`);
+      msg.reply(`Unauthorized. ${caller} is not permitted to deploy.`);
       return;
     }
-    msg.reply(`Starting ${environment}:${deployTag} continuous deploy.`);
+
+    robot.logger.info(`Deploy: ${caller} → ${app} ${environment} ${deployTag}`);
+    msg.reply(`Deploying ${app} to ${environment}: ${deployTag}`);
+
     try {
-      let {stdout, stderr} = await exec(`sudo ${deployScriptPath}/deploy_api.sh ${environment} ${deployTag} ${artifactUrl}`);
-      if (stdout) {
-        robot.logger.info(`stdout: ${stdout}`);
-      }
-      if (stderr) {
-        robot.logger.info(`stderr: ${stderr}`);
-      }
+      const cmd = `sudo ${deployScriptPath}/deploy.sh ${caller} ${app} ${environment} ${deployTag} ${artifactUrl}`;
+      const {stdout, stderr} = await exec(cmd, {timeout: 600000});
+      if (stdout) robot.logger.info(`stdout: ${stdout}`);
+      if (stderr) robot.logger.info(`stderr: ${stderr}`);
+      msg.reply(`Deploy complete: ${app} ${deployTag} → ${environment}`);
     } catch (e) {
       robot.logger.error(e);
-      msg.reply(`an error occurred.\n${e}`);
+      msg.reply(`Deploy failed: ${app} ${deployTag} → ${environment}\n${e.message || e}`);
     }
   });
 };
