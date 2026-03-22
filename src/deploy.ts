@@ -105,6 +105,7 @@ async function verifyBotDeploy(
 
   if (!attachments?.length) {
     robot.logger.error('Bot deploy: no attachments found');
+    msg.reply('Deploy blocked: bot message has no attachments.');
     return false;
   }
 
@@ -132,6 +133,7 @@ async function verifyBotDeploy(
   );
   if (!runMatch) {
     robot.logger.error(`Bot deploy: could not parse run URL: ${runUrl}`);
+    msg.reply(`Deploy blocked: could not parse run URL from attachment.`);
     return false;
   }
 
@@ -145,12 +147,16 @@ async function verifyBotDeploy(
 
   if (run._status !== 200) {
     robot.logger.error(`Bot deploy: run ${runId} not found (${run._status})`);
+    msg.reply(`Deploy blocked: GitHub run ${runId} not found (HTTP ${run._status}).`);
     return false;
   }
 
   if (run.status !== 'completed' || run.conclusion !== 'success') {
     robot.logger.error(
       `Bot deploy: run ${runId} not successful — ${run.status}/${run.conclusion}`
+    );
+    msg.reply(
+      `Deploy blocked: CI run ${runId} is ${run.status}/${run.conclusion}.`
     );
     return false;
   }
@@ -178,6 +184,9 @@ async function verifyBotDeploy(
 
   if (reviews._status !== 200 || !Array.isArray(reviews)) {
     robot.logger.error('Bot deploy: could not fetch PR reviews');
+    msg.reply(
+      `Deploy blocked: could not fetch reviews for PR #${pr.number}.`
+    );
     return false;
   }
 
@@ -189,6 +198,10 @@ async function verifyBotDeploy(
 
   if (teamMembers._status !== 200 || !Array.isArray(teamMembers)) {
     robot.logger.error('Bot deploy: could not fetch deployers team');
+    msg.reply(
+      'Deploy blocked: could not fetch deployers team from GitHub ' +
+        `(HTTP ${teamMembers._status}). Check GITHUB_TOKEN scopes.`
+    );
     return false;
   }
 
@@ -233,109 +246,128 @@ module.exports = (robot: any) => {
       const botId =
         msg.message.rawMessage?.bot_id;
 
-      if (!VALID_APPS.includes(app as any)) {
-        msg.reply(`Unknown app: ${app}. Expected: ${VALID_APPS.join(', ')}`);
-        return;
-      }
-
-      if (!VALID_ENVS.includes(environment as any)) {
-        msg.reply(
-          `Unknown env: ${environment}. Expected: ${VALID_ENVS.join(', ')}`
-        );
-        return;
-      }
-
-      if (!artifactUrl.startsWith(ARTIFACT_URL_PREFIX)) {
-        robot.logger.error(
-          `Blocked deploy — bad artifact URL: ${artifactUrl}`
-        );
-        msg.reply(
-          `Deploy blocked: artifact URL must start with ${ARTIFACT_URL_PREFIX}`
-        );
-        return;
-      }
-
-      // Check environment matches this host.
-      if (environment !== hostEnv) {
-        if (environment === 'prd' && hostEnv === 'sonarmd') {
-          robot.logger.info('prod host (sonarmd) — proceeding');
-        } else {
-          return;
-        }
-      }
-
-      const token = process.env.GITHUB_TOKEN;
-      if (!token) {
-        robot.logger.error('GITHUB_TOKEN not set — cannot authorize deploys');
-        msg.reply('Deploy blocked: GITHUB_TOKEN not configured.');
-        return;
-      }
-
-      // --- Authorization: two paths ---
-
-      if (botId === DEPLOY_BOT_ID) {
-        // Automated CI deploy — bot ID verified by Slack.
-        robot.logger.info(
-          `CI deploy from bot ${botId}: ${app} ${environment} ${deployTag}`
-        );
-
-        const verified = await verifyBotDeploy(msg, robot, token);
-        if (!verified) {
-          return;
-        }
-      } else {
-        // Human deploy — map Slack user to GitHub, check team membership.
-        const githubUser = SLACK_TO_GITHUB[caller];
-        if (!githubUser) {
-          robot.logger.error(
-            `Unknown Slack user: ${caller} — no GitHub mapping`
-          );
-          msg.reply(
-            `Unauthorized. ${caller} has no deployer mapping. ` +
-              'Contact an admin to be added.'
-          );
-          return;
-        }
-
-        const isMember = await isTeamMember(githubUser, token);
-        if (!isMember) {
-          robot.logger.error(
-            `${caller} (${githubUser}) is not in ${DEPLOYERS_TEAM} team`
-          );
-          msg.reply(
-            `Unauthorized. ${githubUser} is not a member of the ` +
-              `${DEPLOYERS_TEAM} team.`
-          );
-          return;
-        }
-
-        robot.logger.info(
-          `Human deploy: ${caller} (${githubUser}) → ` +
-            `${app} ${environment} ${deployTag}`
-        );
-      }
-
-      // --- Execute deploy ---
-
-      msg.reply(`Deploying ${app} to ${environment}: ${deployTag}`);
-
       try {
-        const cmd =
-          `sudo ${DEPLOY_SCRIPT} ${app} ${environment}` +
-          ` ${deployTag} ${artifactUrl}`;
-        const {stdout, stderr} = await exec(cmd, {timeout: DEPLOY_TIMEOUT});
-        if (stdout) {
-          robot.logger.info(`stdout: ${stdout}`);
+        if (!VALID_APPS.includes(app as any)) {
+          msg.reply(`Unknown app: ${app}. Expected: ${VALID_APPS.join(', ')}`);
+          return;
         }
-        if (stderr) {
-          robot.logger.info(`stderr: ${stderr}`);
+
+        if (!VALID_ENVS.includes(environment as any)) {
+          msg.reply(
+            `Unknown env: ${environment}. Expected: ${VALID_ENVS.join(', ')}`
+          );
+          return;
         }
-        msg.reply(`Deploy complete: ${app} ${deployTag} → ${environment}`);
-      } catch (e: any) {
-        robot.logger.error(e);
+
+        if (!artifactUrl.startsWith(ARTIFACT_URL_PREFIX)) {
+          robot.logger.error(
+            `Blocked deploy — bad artifact URL: ${artifactUrl}`
+          );
+          msg.reply(
+            `Deploy blocked: artifact URL must start with ` +
+              `${ARTIFACT_URL_PREFIX}`
+          );
+          return;
+        }
+
+        // Check environment matches this host.
+        if (environment !== hostEnv) {
+          if (environment === 'prd' && hostEnv === 'sonarmd') {
+            robot.logger.info('prod host (sonarmd) — proceeding');
+          } else {
+            return;
+          }
+        }
+
+        const token = process.env.GITHUB_TOKEN;
+        if (!token) {
+          robot.logger.error(
+            'GITHUB_TOKEN not set — cannot authorize deploys'
+          );
+          msg.reply('Deploy blocked: GITHUB_TOKEN not configured.');
+          return;
+        }
+
+        // --- Authorization: two paths ---
+
+        if (botId === DEPLOY_BOT_ID) {
+          // Automated CI deploy — bot ID verified by Slack.
+          robot.logger.info(
+            `CI deploy from bot ${botId}: ` +
+              `${app} ${environment} ${deployTag}`
+          );
+
+          const verified = await verifyBotDeploy(msg, robot, token);
+          if (!verified) {
+            return;
+          }
+        } else {
+          // Human deploy — map Slack user to GitHub, check team membership.
+          const githubUser = SLACK_TO_GITHUB[caller];
+          if (!githubUser) {
+            robot.logger.error(
+              `Unknown Slack user: ${caller} — no GitHub mapping`
+            );
+            msg.reply(
+              `Unauthorized. ${caller} has no deployer mapping. ` +
+                'Contact an admin to be added.'
+            );
+            return;
+          }
+
+          const isMember = await isTeamMember(githubUser, token);
+          if (!isMember) {
+            robot.logger.error(
+              `${caller} (${githubUser}) not in ${DEPLOYERS_TEAM}`
+            );
+            msg.reply(
+              `Unauthorized. ${githubUser} is not a member of the ` +
+                `${DEPLOYERS_TEAM} team.`
+            );
+            return;
+          }
+
+          robot.logger.info(
+            `Human deploy: ${caller} (${githubUser}) → ` +
+              `${app} ${environment} ${deployTag}`
+          );
+        }
+
+        // --- Execute deploy ---
+
+        msg.reply(`Deploying ${app} to ${environment}: ${deployTag}`);
+
+        try {
+          const cmd =
+            `sudo ${DEPLOY_SCRIPT} ${app} ${environment}` +
+            ` ${deployTag} ${artifactUrl}`;
+          const {stdout, stderr} = await exec(cmd, {
+            timeout: DEPLOY_TIMEOUT,
+          });
+          if (stdout) {
+            robot.logger.info(`stdout: ${stdout}`);
+          }
+          if (stderr) {
+            robot.logger.info(`stderr: ${stderr}`);
+          }
+          msg.reply(
+            `Deploy complete: ${app} ${deployTag} → ${environment}`
+          );
+        } catch (e: any) {
+          robot.logger.error(e);
+          msg.reply(
+            `Deploy failed: ${app} ${deployTag} → ${environment}\n` +
+              `${e.stderr || e.message || e}`
+          );
+        }
+      } catch (err: any) {
+        const context = `${app} ${environment} ${deployTag}`;
+        const detail = err.message || String(err);
+        robot.logger.error(`Deploy error [${context}]: ${detail}`);
+        robot.logger.error(err.stack || err);
         msg.reply(
-          `Deploy failed: ${app} ${deployTag} → ${environment}\n` +
-            `${e.message || e}`
+          `Deploy error [${context}]: ${detail}\n` +
+            'Check hubot logs for full stack trace.'
         );
       }
     }
