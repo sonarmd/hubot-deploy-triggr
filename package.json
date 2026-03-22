@@ -1,27 +1,27 @@
 {
   "name": "hubot-deploy-triggr",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "author": "Triggr Health",
-  "description": "Run ansible deploy from slack",
+  "description": "Authorized deploy orchestration from Slack via hubot",
   "keywords": [
     "hubot",
     "hubot-scripts"
   ],
   "license": "MIT",
-  "main": "index.coffee",
+  "main": "index.js",
   "repository": {
     "type": "git",
-    "url": "git://github.com/triggr/hubot-deploy-triggr.git"
+    "url": "git://github.com/sonarmd/hubot-deploy-triggr.git"
   },
   "devDependencies": {
-    "eslint": "4.1.1",
-    "prettier": "1.9.1"
+    "@types/node": "^25.5.0",
+    "typescript": "^5.0.0"
   },
   "scripts": {
-    "lint": "prettier --list-different \"**/*.js\" && eslint --max-warnings 0 .",
-    "prettier": "prettier --write \"**/*.js\""
+    "build": "tsc",
+    "prepublish": "npm run build"
   },
   "bugs": {
-    "url": "https://github.com/triggr/hubot-deploy-triggr/issues"
+    "url": "https://github.com/sonarmd/hubot-deploy-triggr/issues"
   }
 }
