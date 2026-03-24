@@ -15,7 +15,7 @@ const deployScriptPath = '/home/hubot/DeploymentScripts/hubot';
 
 const authorizedSlackUsers = [
   'devops',      // deploy bot
-  'agora',       // CI bot
+  'Agora',       // CI bot
   'avespoli',
   'jlyons',
   'tnguyen',
@@ -53,13 +53,14 @@ module.exports = function(robot) {
       if (environment === 'prd' && hostEnv === 'sonarmd') {
         robot.logger.info('prod host (sonarmd) — proceeding');
       } else {
+        msg.reply(`Wrong host. This bot handles ${hostEnv}, not ${environment}.`);
         return;
       }
     }
 
     if (!caller || !authorizedSlackUsers.includes(caller)) {
       robot.logger.error(`Unauthorized deploy attempt by ${caller}`);
-      msg.reply(`Unauthorized. ${caller} is not permitted to deploy.`);
+      msg.reply(`I'm tired. Maybe later.`);
       return;
     }
 
