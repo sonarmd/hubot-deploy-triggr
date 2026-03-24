@@ -14,8 +14,8 @@
     "url": "git://github.com/triggr/hubot-deploy-triggr.git"
   },
   "devDependencies": {
-    "eslint": "4.1.1",
-    "prettier": "1.9.1"
+    "eslint": "^8.57.0",
+    "prettier": "^3.3.3"
   },
   "scripts": {
     "lint": "prettier --list-different \"**/*.js\" && eslint --max-warnings 0 .",
