@@ -15,6 +15,7 @@ const deployScriptPath = '/home/hubot/DeploymentScripts/hubot';
 
 const authorizedSlackUsers = [
   'devops',      // deploy bot
+  'agora',       // CI bot
   'avespoli',
   'jlyons',
   'tnguyen',
@@ -30,7 +31,7 @@ const hostname = os.hostname();
 const hostEnv = hostname.split(/[-.]/)[1];
 
 module.exports = function(robot) {
-  robot.respond(/deploy (\w+) (\w+) ([\w-\.]+) (.+)$/i, async (msg) => {
+  robot.hear(/^@r2-d2 deploy (\w+) (\w+) ([\w-\.]+) (.+)$/i, async (msg) => {
     const app = msg.match[1].toLowerCase();
     const environment = msg.match[2].toLowerCase();
     const deployTag = msg.match[3];
