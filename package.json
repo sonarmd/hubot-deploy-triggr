@@ -8,20 +8,25 @@
     "hubot-scripts"
   ],
   "license": "MIT",
-  "main": "index.coffee",
+  "main": "index.js",
   "repository": {
     "type": "git",
-    "url": "git://github.com/triggr/hubot-deploy-triggr.git"
-  },
-  "devDependencies": {
-    "eslint": "^8.57.0",
-    "prettier": "^3.3.3"
+    "url": "git://github.com/sonarmd/hubot-deploy-triggr.git"
   },
   "scripts": {
+    "start": "node_modules/.bin/hubot -a slack",
     "lint": "prettier --list-different \"**/*.js\" && eslint --max-warnings 0 .",
     "prettier": "prettier --write \"**/*.js\""
   },
   "bugs": {
-    "url": "https://github.com/triggr/hubot-deploy-triggr/issues"
+    "url": "https://github.com/sonarmd/hubot-deploy-triggr/issues"
+  },
+  "dependencies": {
+    "hubot": "^14.1.0",
+    "hubot-slack": "^4.10.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0",
+    "prettier": "^3.3.3"
   }
 }
