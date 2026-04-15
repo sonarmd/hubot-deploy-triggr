@@ -1,57 +1,109 @@
 // Description:
-//   Universal deploy — handles frontend and API deploys via Slack.
-//   Two auth paths: bot (CI automated) and human (manual Slack command).
+//   Automated deploy — listens for CD pipeline messages, validates the
+//   GitHub release artifact, then deploys.
 //
-// Commands:
-//   hubot deploy <app> <env> <tag> <artifact_url>
+//   The deploy tag is the source of truth.  Hubot derives env, app, repo,
+//   and the release URL from it.  The human-readable URL in the message
+//   is ignored — it's there so people can click it.
+//
+//   Fallback: if no structured tag, Hubot extracts env + app identifier
+//   from the text and deploys latest.
 
-import {promisify} from 'util';
-import {exec as execCb} from 'child_process';
+import { createHash } from 'crypto';
+import { createReadStream, createWriteStream, mkdirSync, unlinkSync, rmdirSync } from 'fs';
 import * as https from 'https';
 import * as os from 'os';
+import * as path from 'path';
+import { promisify } from 'util';
+import { exec as execCb } from 'child_process';
 
 const exec = promisify(execCb);
 
-const DEPLOY_SCRIPT = '/home/hubot/DeploymentScripts/hubot/deploy.sh';
-const DEPLOY_TIMEOUT = 600_000; // 10 minutes
+// ── Configuration ────────────────────────────────────────────────────────────
 
-// Deploy bot Slack bot_id — verified by Slack, not spoofable.
-const DEPLOY_BOT_ID = 'B0AMQKWT77W';
+const DEPLOY_SCRIPT = process.env.DEPLOY_SCRIPT
+  ?? '/home/hubot/DeploymentScripts/hubot/deploy.sh';
+const DEPLOY_TIMEOUT = 600_000; // 10 min
 
-// Artifact URLs must originate from sonarmd GitHub org.
-const ARTIFACT_URL_PREFIX = 'https://api.github.com/repos/sonarmd/';
+// Agora CI bot — Slack-verified bot_id, not spoofable.
+const DEPLOY_BOT_ID = process.env.AGORA_BOT_ID ?? 'B0AMQKWT77W';
 
 const GITHUB_ORG = 'sonarmd';
-const DEPLOYERS_TEAM = 'deployers';
 
-// Slack username → GitHub username mapping for human deploys.
-const SLACK_TO_GITHUB: Record<string, string> = {
-  avespoli: 'avespoli-sonarmd',
-  tnguyen: 'tn70626',
-  cforrester: 'cforrester-sonarmd',
-  vsiqueira: 'vsiqueirasonarmd',
+const ALLOWED_CHANNELS = new Set(
+  (process.env.DEPLOY_CHANNELS ?? 'ops,deployments,ops-dev').split(','),
+);
+
+// Identifier → repo name.
+const APP_MAP: Record<string, string> = {
+  api:    'triggr_api',
+  fe:     'frontend',
+  mobile: 'frontend-patient-app',
+  cdk:    'infra-cdk',
 };
 
-const VALID_APPS = ['frontend', 'api'] as const;
-const VALID_ENVS = ['dev', 'stg', 'prd'] as const;
+// ── Deploy context ───────────────────────────────────────────────────────────
 
-const hostname = os.hostname();
-const hostEnv = hostname.split(/[-.]/)[1];
-
-interface GitHubApiOptions {
-  path: string;
-  token: string;
+interface DeployContext {
+  env: string;
+  identifier: string;
+  repo: string;
+  tag: string;
 }
 
-function githubApi(opts: GitHubApiOptions): Promise<any> {
+// ── Tag parsing ──────────────────────────────────────────────────────────────
+
+// Tag format: {env}-{identifier}-v?{version}-b{build}
+// Examples:   stg-api-1.0.0-b81   prd-fe-v2.3.1-b44   dev-mobile-v0.1.0-b3
+const TAG_PATTERN = /\b(dev|stg|prd)-(\w+)-v?([\d.]+)-b(\d+)\b/;
+
+function parseTag(text: string): DeployContext | null {
+  const m = text.match(TAG_PATTERN);
+  if (!m) return null;
+
+  const [tag, env, identifier] = m;
+  const repo = APP_MAP[identifier];
+  if (!repo) return null;
+
+  return { env, identifier, repo, tag };
+}
+
+// ── Fallback parsing (env + identifier, no structured tag) ───────────────────
+
+function parseFallback(text: string): { env: string; identifier: string; repo: string } | null {
+  const envMatch = text.match(/\b(dev|stg|prd)\b/i);
+  if (!envMatch) return null;
+  const env = envMatch[1].toLowerCase();
+
+  const knownIds = Object.keys(APP_MAP);
+  const identifier = knownIds.find((id) =>
+    new RegExp(`\\b${id}\\b`, 'i').test(text),
+  );
+  if (!identifier) return null;
+
+  return { env, identifier, repo: APP_MAP[identifier] };
+}
+
+// ── Host env detection ───────────────────────────────────────────────────────
+
+const hostname = os.hostname();
+const hostEnv = (() => {
+  const seg = hostname.split(/[-.]/)[1];
+  if (seg === 'sonarmd') return 'prd';
+  return seg ?? '';
+})();
+
+// ── GitHub API helpers ───────────────────────────────────────────────────────
+
+function ghApi(apiPath: string, token: string): Promise<any> {
   return new Promise((resolve, reject) => {
     const req = https.request(
       {
         hostname: 'api.github.com',
-        path: opts.path,
+        path: apiPath,
         method: 'GET',
         headers: {
-          Authorization: `Bearer ${opts.token}`,
+          Authorization: `Bearer ${token}`,
           Accept: 'application/vnd.github+json',
           'User-Agent': 'hubot-deploy-triggr',
           'X-GitHub-Api-Version': '2022-11-28',
@@ -59,317 +111,258 @@ function githubApi(opts: GitHubApiOptions): Promise<any> {
       },
       (res) => {
         let body = '';
-        res.on('data', (chunk: string) => {
-          body += chunk;
-        });
+        res.on('data', (chunk: string) => { body += chunk; });
         res.on('end', () => {
-          if (res.statusCode === 204) {
-            resolve({_status: 204});
-            return;
-          }
           try {
             const parsed = JSON.parse(body);
             parsed._status = res.statusCode;
             resolve(parsed);
           } catch {
-            reject(new Error(`GitHub API: ${res.statusCode} — ${body}`));
+            reject(new Error(`GitHub API ${res.statusCode}: ${body.slice(0, 200)}`));
           }
         });
-      }
+      },
     );
     req.on('error', reject);
     req.end();
   });
 }
 
-async function isTeamMember(
-  githubUser: string,
-  token: string
-): Promise<boolean> {
-  const res = await githubApi({
-    path: `/orgs/${GITHUB_ORG}/teams/${DEPLOYERS_TEAM}/members/${githubUser}`,
-    token,
+function downloadFile(url: string, dest: string, token: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const file = createWriteStream(dest);
+    const req = https.request(
+      url,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/octet-stream',
+          'User-Agent': 'hubot-deploy-triggr',
+        },
+      },
+      (res) => {
+        if (res.statusCode === 302 && res.headers.location) {
+          file.close();
+          const redirect = https.get(res.headers.location, (r2) => {
+            r2.pipe(file);
+            file.on('finish', () => { file.close(); resolve(dest); });
+            r2.on('error', reject);
+          });
+          redirect.on('error', reject);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          file.close();
+          reject(new Error(`Asset download failed: HTTP ${res.statusCode}`));
+          return;
+        }
+        res.pipe(file);
+        file.on('finish', () => { file.close(); resolve(dest); });
+      },
+    );
+    req.on('error', reject);
+    req.end();
   });
-  return res._status === 204;
 }
 
-async function verifyBotDeploy(
-  msg: any,
-  robot: any,
-  token: string
-): Promise<boolean> {
-  // Extract "View Run" URL from attachment to get repo + run ID.
-  const attachments =
-    msg.message.rawMessage?.attachments ||
-    msg.message.rawMessage?.message?.attachments;
-
-  if (!attachments?.length) {
-    robot.logger.error('Bot deploy: no attachments found');
-    msg.reply('Deploy blocked: bot message has no attachments.');
-    return false;
-  }
-
-  let runUrl: string | undefined;
-  for (const att of attachments) {
-    const actions = att.actions || [];
-    for (const action of actions) {
-      if (action.type === 'button' && action.url?.includes('/actions/runs/')) {
-        runUrl = action.url;
-      }
-    }
-    if (!runUrl && att.title_link?.includes('/actions/runs/')) {
-      runUrl = att.title_link;
-    }
-  }
-
-  if (!runUrl) {
-    robot.logger.info('Bot deploy: no run URL in attachments — skipping CI verification');
-    return true;
-  }
-
-  // Parse: https://github.com/sonarmd/<repo>/actions/runs/<id>
-  const runMatch = runUrl.match(
-    /github\.com\/sonarmd\/([^/]+)\/actions\/runs\/(\d+)/
-  );
-  if (!runMatch) {
-    robot.logger.error(`Bot deploy: could not parse run URL: ${runUrl}`);
-    msg.reply(`Deploy blocked: could not parse run URL from attachment.`);
-    return false;
-  }
-
-  const [, repo, runId] = runMatch;
-
-  // Verify the workflow run exists and completed successfully.
-  const run = await githubApi({
-    path: `/repos/${GITHUB_ORG}/${repo}/actions/runs/${runId}`,
-    token,
+function sha256File(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    const stream = createReadStream(filePath);
+    stream.on('data', (chunk: Buffer) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
   });
-
-  if (run._status !== 200) {
-    robot.logger.error(`Bot deploy: run ${runId} not found (${run._status})`);
-    msg.reply(`Deploy blocked: GitHub run ${runId} not found (HTTP ${run._status}).`);
-    return false;
-  }
-
-  if (run.status !== 'completed' || run.conclusion !== 'success') {
-    robot.logger.error(
-      `Bot deploy: run ${runId} not successful — ${run.status}/${run.conclusion}`
-    );
-    msg.reply(
-      `Deploy blocked: CI run ${runId} is ${run.status}/${run.conclusion}.`
-    );
-    return false;
-  }
-
-  // Find the PR for the head commit and verify an approved review
-  // from a deployers team member on the final commit.
-  const headSha = run.head_sha;
-  const pulls = await githubApi({
-    path: `/repos/${GITHUB_ORG}/${repo}/commits/${headSha}/pulls`,
-    token,
-  });
-
-  if (pulls._status !== 200 || !Array.isArray(pulls) || !pulls.length) {
-    robot.logger.info(
-      `Bot deploy: no PR found for commit ${headSha} — skipping approval check`
-    );
-    return true;
-  }
-
-  const pr = pulls[0];
-  const reviews = await githubApi({
-    path: `/repos/${GITHUB_ORG}/${repo}/pulls/${pr.number}/reviews`,
-    token,
-  });
-
-  if (reviews._status !== 200 || !Array.isArray(reviews)) {
-    robot.logger.error('Bot deploy: could not fetch PR reviews');
-    msg.reply(
-      `Deploy blocked: could not fetch reviews for PR #${pr.number}.`
-    );
-    return false;
-  }
-
-  // Get deployers team members.
-  const teamMembers = await githubApi({
-    path: `/orgs/${GITHUB_ORG}/teams/${DEPLOYERS_TEAM}/members`,
-    token,
-  });
-
-  if (teamMembers._status !== 200 || !Array.isArray(teamMembers)) {
-    robot.logger.error('Bot deploy: could not fetch deployers team');
-    msg.reply(
-      'Deploy blocked: could not fetch deployers team from GitHub ' +
-        `(HTTP ${teamMembers._status}). Check GITHUB_TOKEN scopes.`
-    );
-    return false;
-  }
-
-  const deployerLogins = new Set(
-    teamMembers.map((m: any) => m.login.toLowerCase())
-  );
-
-  // Check for an approved review on the final commit from a deployer.
-  const validApproval = reviews.some(
-    (r: any) =>
-      r.state === 'APPROVED' &&
-      r.commit_id === headSha &&
-      deployerLogins.has(r.user.login.toLowerCase())
-  );
-
-  if (!validApproval) {
-    robot.logger.error(
-      `Bot deploy: no approved review from deployers team on commit ${headSha}`
-    );
-    msg.reply(
-      'Deploy blocked: no approved review from a deployers team member ' +
-        'on the final commit.'
-    );
-    return false;
-  }
-
-  robot.logger.info(
-    `Bot deploy: verified run ${runId}, PR #${pr.number}, approval on ${headSha}`
-  );
-  return true;
 }
+
+// ── Release validation ───────────────────────────────────────────────────────
+
+interface ValidatedRelease {
+  commitSha: string;
+  assetUrl: string;
+  assetName: string;
+}
+
+async function validateRelease(
+  repo: string,
+  tag: string,
+  token: string,
+): Promise<{ ok: true; release: ValidatedRelease } | { ok: false; reason: string }> {
+  const release = await ghApi(
+    `/repos/${GITHUB_ORG}/${repo}/releases/tags/${tag}`,
+    token,
+  );
+
+  if (release._status === 404) {
+    return { ok: false, reason: `Release \`${tag}\` not found in \`${GITHUB_ORG}/${repo}\`` };
+  }
+  if (release._status !== 200) {
+    return { ok: false, reason: `GitHub API error ${release._status} fetching release` };
+  }
+
+  const commitSha = release.target_commitish;
+  if (!commitSha || commitSha.length < 7) {
+    return { ok: false, reason: `Release \`${tag}\` has no valid commit SHA` };
+  }
+
+  const assets: any[] = release.assets ?? [];
+  if (assets.length === 0) {
+    return { ok: false, reason: `Release \`${tag}\` has no assets` };
+  }
+
+  const tarAsset = assets.find((a: any) => a.name.endsWith('.tar.gz')) ?? assets[0];
+
+  return {
+    ok: true,
+    release: {
+      commitSha,
+      assetUrl: tarAsset.url,
+      assetName: tarAsset.name,
+    },
+  };
+}
+
+// ── Main plugin ──────────────────────────────────────────────────────────────
+
+const TRIGGER = /\b(dev|stg|prd)\b/i;
 
 module.exports = (robot: any) => {
-  robot.respond(
-    /deploy (\w+) (\w+) ([\w\-.]+) (.+)$/i,
-    async (msg: any) => {
-      const app = msg.match[1].toLowerCase();
-      const environment = msg.match[2].toLowerCase();
-      const deployTag = msg.match[3];
-      const artifactUrl = msg.match[4].replace(/[<>]/g, '').trim();
-      const caller = msg.message.user.name;
-      const botId =
-        msg.message.rawMessage?.bot_id;
+  robot.hear(TRIGGER, async (msg: any) => {
+    const botId = msg.message.rawMessage?.bot_id;
+    if (botId !== DEPLOY_BOT_ID) return;
+
+    const channel = msg.message.room;
+    if (!ALLOWED_CHANNELS.has(channel)) return;
+
+    const text = msg.message.text ?? '';
+
+    // ── Try structured tag first ───────────────────────────────────────────
+    const ctx = parseTag(text);
+
+    if (ctx) {
+      const { env, identifier, repo, tag } = ctx;
+      if (env !== hostEnv) return;
+
+      robot.logger.info(`[deploy] tag: ${tag} | env: ${env} | app: ${identifier} (${repo})`);
+
+      const token = process.env.GITHUB_TOKEN;
+      if (!token) {
+        msg.send(':x: Deploy blocked — `GITHUB_TOKEN` not configured.');
+        return;
+      }
+
+      msg.send(`:hourglass_flowing_sand: Validating \`${tag}\` in \`${GITHUB_ORG}/${repo}\`...`);
+
+      const result = await validateRelease(repo, tag, token);
+      if (!result.ok) {
+        robot.logger.error(`[deploy] ${result.reason}`);
+        msg.send(`:x: Deploy blocked — ${result.reason}`);
+        return;
+      }
+
+      const { commitSha, assetUrl, assetName } = result.release;
+
+      // Download and verify
+      const stagingDir = path.join(STAGING_BASE, tag);
+      if (!path.resolve(stagingDir).startsWith(STAGING_BASE + path.sep)) {
+        msg.send(`:x: Deploy blocked — invalid tag \`${tag}\``);
+        return;
+      }
+      mkdirSync(stagingDir, { recursive: true });
+      const assetPath = path.join(stagingDir, assetName);
 
       try {
-        if (!VALID_APPS.includes(app as any)) {
-          msg.reply(`Unknown app: ${app}. Expected: ${VALID_APPS.join(', ')}`);
-          return;
-        }
-
-        if (!VALID_ENVS.includes(environment as any)) {
-          msg.reply(
-            `Unknown env: ${environment}. Expected: ${VALID_ENVS.join(', ')}`
-          );
-          return;
-        }
-
-        if (!artifactUrl.startsWith(ARTIFACT_URL_PREFIX)) {
-          robot.logger.error(
-            `Blocked deploy — bad artifact URL: ${artifactUrl}`
-          );
-          msg.reply(
-            `Deploy blocked: artifact URL must start with ` +
-              `${ARTIFACT_URL_PREFIX}`
-          );
-          return;
-        }
-
-        // Check environment matches this host.
-        if (environment !== hostEnv) {
-          if (environment === 'prd' && hostEnv === 'sonarmd') {
-            robot.logger.info('prod host (sonarmd) — proceeding');
-          } else {
-            return;
-          }
-        }
-
-        const token = process.env.GITHUB_TOKEN;
-        if (!token) {
-          robot.logger.error(
-            'GITHUB_TOKEN not set — cannot authorize deploys'
-          );
-          msg.reply('Deploy blocked: GITHUB_TOKEN not configured.');
-          return;
-        }
-
-        // --- Authorization: two paths ---
-
-        if (botId === DEPLOY_BOT_ID) {
-          // Automated CI deploy — bot ID verified by Slack.
-          robot.logger.info(
-            `CI deploy from bot ${botId}: ` +
-              `${app} ${environment} ${deployTag}`
-          );
-
-          const verified = await verifyBotDeploy(msg, robot, token);
-          if (!verified) {
-            return;
-          }
-        } else {
-          // Human deploy — map Slack user to GitHub, check team membership.
-          const githubUser = SLACK_TO_GITHUB[caller];
-          if (!githubUser) {
-            robot.logger.error(
-              `Unknown Slack user: ${caller} — no GitHub mapping`
-            );
-            msg.reply(
-              `Unauthorized. ${caller} has no deployer mapping. ` +
-                'Contact an admin to be added.'
-            );
-            return;
-          }
-
-          const isMember = await isTeamMember(githubUser, token);
-          if (!isMember) {
-            robot.logger.error(
-              `${caller} (${githubUser}) not in ${DEPLOYERS_TEAM}`
-            );
-            msg.reply(
-              `Unauthorized. ${githubUser} is not a member of the ` +
-                `${DEPLOYERS_TEAM} team.`
-            );
-            return;
-          }
-
-          robot.logger.info(
-            `Human deploy: ${caller} (${githubUser}) → ` +
-              `${app} ${environment} ${deployTag}`
-          );
-        }
-
-        // --- Execute deploy ---
-
-        msg.reply(`Deploying ${app} to ${environment}: ${deployTag}`);
-
-        try {
-          const cmd =
-            `sudo ${DEPLOY_SCRIPT} ${app} ${environment}` +
-            ` ${deployTag} ${artifactUrl}`;
-          const {stdout, stderr} = await exec(cmd, {
-            timeout: DEPLOY_TIMEOUT,
-          });
-          if (stdout) {
-            robot.logger.info(`stdout: ${stdout}`);
-          }
-          if (stderr) {
-            robot.logger.info(`stderr: ${stderr}`);
-          }
-          msg.reply(
-            `Deploy complete: ${app} ${deployTag} → ${environment}`
-          );
-        } catch (e: any) {
-          robot.logger.error(e);
-          msg.reply(
-            `Deploy failed: ${app} ${deployTag} → ${environment}\n` +
-              `${e.stderr || e.message || e}`
-          );
-        }
+        await downloadFile(assetUrl, assetPath, token);
       } catch (err: any) {
-        const context = `${app} ${environment} ${deployTag}`;
-        const detail = err.message || String(err);
-        robot.logger.error(`Deploy error [${context}]: ${detail}`);
-        robot.logger.error(err.stack || err);
-        msg.reply(
-          `Deploy error [${context}]: ${detail}\n` +
-            'Check hubot logs for full stack trace.'
-        );
+        msg.send(`:x: Download failed — ${err.message}`);
+        cleanup(assetPath, stagingDir);
+        return;
       }
+
+      const fileHash = await sha256File(assetPath);
+      robot.logger.info(`[deploy] SHA256: ${fileHash} | commit: ${commitSha}`);
+
+      const releaseUrl = `https://github.com/${GITHUB_ORG}/${repo}/releases/${tag}`;
+
+      msg.send(
+        `:rocket: Deploying \`${repo}\` → \`${env}\`\n` +
+        `Tag: \`${tag}\` | Commit: \`${commitSha.slice(0, 8)}\` | SHA256: \`${fileHash.slice(0, 12)}...\``,
+      );
+
+      await runDeploy(msg, robot, identifier, env, tag, releaseUrl);
+      cleanup(assetPath, stagingDir);
+      return;
     }
-  );
+
+    // ── Fallback: env + identifier, construct URL ─────────────────────────
+    const fallback = parseFallback(text);
+    if (!fallback) return;
+
+    const { env, identifier, repo } = fallback;
+    if (env !== hostEnv) return;
+
+    const tag = 'latest';
+    const releaseUrl = `https://github.com/${GITHUB_ORG}/${repo}/releases/${tag}`;
+
+    robot.logger.info(`[deploy] fallback | env: ${env} | app: ${identifier} | ${releaseUrl}`);
+    msg.send(`:rocket: Deploying \`${repo}\` → \`${env}\` (no structured tag — using latest)`);
+
+    await runDeploy(msg, robot, identifier, env, tag, releaseUrl);
+  });
 };
+
+// ── Deploy execution ─────────────────────────────────────────────────────────
+
+async function runDeploy(
+  msg: any,
+  robot: any,
+  identifier: string,
+  env: string,
+  tag: string,
+  artifactUrl: string,
+): Promise<void> {
+  try {
+    const args = [
+      'sudo', '--non-interactive',
+      DEPLOY_SCRIPT,
+      'hubot',
+      identifier,
+      env,
+      tag || 'latest',
+      artifactUrl,
+    ];
+
+    const { stdout, stderr } = await exec(args.join(' '), { timeout: DEPLOY_TIMEOUT });
+
+    if (stderr) robot.logger.info(`[deploy] stderr: ${stderr}`);
+
+    const recap = extractRecap(stdout);
+    msg.send(
+      `:white_check_mark: Deploy SUCCESS — \`${identifier}\` \`${tag || 'latest'}\` → \`${env}\`\n` +
+      `\`\`\`\n${recap}\n\`\`\``,
+    );
+  } catch (err: any) {
+    robot.logger.error(`[deploy] failed: ${err.message}`);
+    const tail = (err.stdout ?? '').split('\n').slice(-30).join('\n');
+    msg.send(
+      `:x: Deploy FAILED — \`${identifier}\` \`${tag || 'latest'}\` → \`${env}\`\n` +
+      `\`\`\`\n${tail || err.stderr || err.message}\n\`\`\``,
+    );
+  }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function extractRecap(stdout: string): string {
+  const lines = stdout.split('\n');
+  const idx = lines.findIndex((l) => l.includes('PLAY RECAP'));
+  if (idx >= 0) return lines.slice(idx, idx + 10).join('\n');
+  return lines.slice(-10).join('\n');
+}
+
+const STAGING_BASE = path.join(os.tmpdir(), 'hubot-deploy');
+
+function cleanup(file: string, dir: string): void {
+  try { unlinkSync(file); } catch { /* already gone */ }
+  try { rmdirSync(dir); } catch { /* not empty or already gone — leave it */ }
+}
