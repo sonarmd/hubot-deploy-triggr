@@ -1,9 +1,10 @@
 "use strict";
+var _a, _b;
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.default = breakGlass;
 const child_process_1 = require("child_process");
-const ANSIBLE_DIR = process.env.ANSIBLE_DIR ?? '/root/triggr_misc/Ansible';
-const ANSIBLE_BIN = process.env.ANSIBLE_PLAYBOOK ?? '/opt/ansible-env/bin/ansible-playbook';
+const ANSIBLE_DIR = (_a = process.env.ANSIBLE_DIR) !== null && _a !== void 0 ? _a : '/root/triggr_misc/Ansible';
+const ANSIBLE_BIN = (_b = process.env.ANSIBLE_PLAYBOOK) !== null && _b !== void 0 ? _b : '/opt/ansible-env/bin/ansible-playbook';
 const VAULT_PASS = '.get-vault-password';
 const SSH_KEY = '~/.ssh/AnsibleRoot.pem';
 const BREAK_GLASS_CHANNEL = 'ops';
@@ -27,14 +28,16 @@ function extractRecap(stdout) {
     return '(no recap found)';
 }
 function interpolateHosts(hosts, env) {
+    var _a;
     return hosts
         .join(',')
         .replace(/\$\{env\}/g, env)
-        .replace(/\$\{env_domain\}/g, ENV_DOMAIN_MAP[env] ?? `${env}.sonarmd.com`);
+        .replace(/\$\{env_domain\}/g, (_a = ENV_DOMAIN_MAP[env]) !== null && _a !== void 0 ? _a : `${env}.sonarmd.com`);
 }
 function runBundleDeploy(bundle, deploy, apiUrl, repo, msg) {
     return new Promise((resolve) => {
-        const hostsList = bundle.hosts ?? (bundle.host ? [bundle.host] : []);
+        var _a;
+        const hostsList = (_a = bundle.hosts) !== null && _a !== void 0 ? _a : (bundle.host ? [bundle.host] : []);
         const hostsCsv = interpolateHosts(hostsList, deploy.env);
         const extraVars = [
             `deploy_app=${deploy.app}`,
@@ -82,7 +85,7 @@ function fetchDeployConfig(tag, repo) {
             `| python3 -c "import json,sys; r=json.load(sys.stdin); a=[x for x in r['assets'] if x['name']=='deploy.json']; print(a[0]['url'] if a else '')"`,
         ].join(' ');
         (0, child_process_1.exec)(getAssetUrl, (err, assetUrl) => {
-            const url = assetUrl?.trim();
+            const url = assetUrl === null || assetUrl === void 0 ? void 0 : assetUrl.trim();
             if (err || !url) {
                 reject(new Error(`Could not find deploy.json in release ${tag}`));
                 return;
@@ -143,7 +146,7 @@ function breakGlass(robot) {
         // Auto-expire after 5 minutes
         setTimeout(() => {
             const d = activeDeploys.get(auditId);
-            if (d?.status === 'pending_reason') {
+            if ((d === null || d === void 0 ? void 0 : d.status) === 'pending_reason') {
                 msg.send(`:x: Break-glass \`${auditId}\` expired. No reason provided within 5 minutes.`);
                 activeDeploys.delete(auditId);
             }
@@ -151,6 +154,7 @@ function breakGlass(robot) {
     });
     // reason <audit_id> <reason text>
     robot.hear(/reason\s+(\S+)\s+(.+)$/i, async (msg) => {
+        var _a, _b;
         const auditId = msg.match[1];
         const reason = msg.match[2].trim();
         const deploy = activeDeploys.get(auditId);
@@ -167,7 +171,7 @@ function breakGlass(robot) {
         msg.send(`:rocket: Break-glass \`${auditId}\` executing.\n` +
             `*Reason:* ${reason}\n` +
             `Deploying \`${deploy.app}\` \`${deploy.tag}\` to \`${deploy.env}\`...`);
-        const repo = APP_TO_REPO[deploy.app] ?? deploy.app;
+        const repo = (_a = APP_TO_REPO[deploy.app]) !== null && _a !== void 0 ? _a : deploy.app;
         const apiUrl = `https://api.github.com/repos/sonarmd/${repo}/releases/tags/${deploy.tag}`;
         let config;
         try {
@@ -179,7 +183,7 @@ function breakGlass(robot) {
             activeDeploys.delete(auditId);
             return;
         }
-        if (!config.bundles?.length) {
+        if (!((_b = config.bundles) === null || _b === void 0 ? void 0 : _b.length)) {
             msg.send(`:x: No bundles found in deploy.json for \`${deploy.app}\`.`);
             deploy.status = 'failed';
             activeDeploys.delete(auditId);
@@ -227,4 +231,3 @@ function breakGlass(robot) {
         msg.send(`Recent deploys:\n${lines.join('\n')}`);
     });
 }
-//# sourceMappingURL=break-glass.js.map
