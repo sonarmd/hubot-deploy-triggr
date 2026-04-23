@@ -18,8 +18,7 @@
     "typescript": "^5.0.0"
   },
   "scripts": {
-    "build": "tsc",
-    "prepublish": "npm run build"
+    "build": "tsc"
   },
   "bugs": {
     "url": "https://github.com/sonarmd/hubot-deploy-triggr/issues"
