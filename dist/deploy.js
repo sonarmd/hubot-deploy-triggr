@@ -253,11 +253,16 @@ module.exports = (robot) => {
             const releaseUrl = `https://github.com/${GITHUB_ORG}/${repo}/releases/${tag}`;
             msg.send(`:rocket: Deploying \`${repo}\` → \`${env}\`\n` +
                 `Tag: \`${tag}\` | Commit: \`${commitSha.slice(0, 8)}\` | SHA256: \`${fileHash.slice(0, 12)}...\``);
-            await runDeploy(msg, robot, identifier, env, tag, releaseUrl);
+            // Pass the api.github.com asset URL (not the human-facing releaseUrl)
+            // because deploy.sh rejects anything outside api.github.com/repos/sonarmd/*.
+            await runDeploy(msg, robot, identifier, env, tag, assetUrl);
             cleanup(assetPath, stagingDir);
             return;
         }
         // ── Fallback: env + identifier, construct URL ─────────────────────────
+        // No structured tag, no validated release → deploy.sh's URL check will
+        // reject the human releaseUrl. Fallback is best-effort; it will fail
+        // at the deploy.sh gate but Hubot still logs for visibility.
         const fallback = parseFallback(text);
         if (!fallback)
             return;
@@ -276,16 +281,34 @@ module.exports = (robot) => {
 async function runDeploy(msg, robot, identifier, env, tag, artifactUrl) {
     var _a;
     try {
-        const args = [
+        // deploy.sh contract (7 positional args — strict):
+        //   <caller> <make_target> <deploy_tag> <artifact_url> <deploy_bundle> <deploy_hosts> <deploy_env>
+        //
+        // make_target follows the ${identifier}_${env} convention (e.g. cdk_stg,
+        // api_prd). deploy_bundle and deploy_hosts are unused by the cdk_*
+        // Makefile targets, so we pass empty strings. Non-cdk apps that DO
+        // consume those will need bundle/hosts added to the Slack trigger
+        // contract — out of scope for this fix.
+        const makeTarget = `${identifier}_${env}`;
+        const deployTag = tag || 'latest';
+        const deployBundle = '';
+        const deployHosts = '';
+        // Use execFile-style quoting via shell-escaping so empty positional
+        // args survive. Quote every arg defensively.
+        const escape = (s) => `'${s.replace(/'/g, "'\\''")}'`;
+        const cmd = [
             'sudo', '--non-interactive',
             DEPLOY_SCRIPT,
-            'hubot',
-            identifier,
-            env,
-            tag || 'latest',
-            artifactUrl,
-        ];
-        const { stdout, stderr } = await exec(args.join(' '), { timeout: DEPLOY_TIMEOUT });
+            escape('hubot'),
+            escape(makeTarget),
+            escape(deployTag),
+            escape(artifactUrl),
+            escape(deployBundle),
+            escape(deployHosts),
+            escape(env),
+        ].join(' ');
+        robot.logger.info(`[deploy] exec: ${cmd}`);
+        const { stdout, stderr } = await exec(cmd, { timeout: DEPLOY_TIMEOUT });
         if (stderr)
             robot.logger.info(`[deploy] stderr: ${stderr}`);
         const recap = extractRecap(stdout);
