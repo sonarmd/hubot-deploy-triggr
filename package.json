@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "hubot": "^14.1.0",
-    "hubot-slack": "^4.10.0"
+    "@hubot-friends/hubot-slack": "^3.8.0"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
