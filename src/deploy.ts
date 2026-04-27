@@ -10,7 +10,16 @@
 //   from the text and deploys latest.
 
 import { createHash } from 'crypto';
-import { createReadStream, createWriteStream, mkdirSync, unlinkSync, rmdirSync } from 'fs';
+import {
+  copyFileSync,
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmdirSync,
+  unlinkSync,
+} from 'fs';
 import * as https from 'https';
 import * as os from 'os';
 import * as path from 'path';
@@ -183,6 +192,28 @@ interface ValidatedRelease {
   assetName: string;
 }
 
+interface DeployManifestBundle {
+  name: string;
+  path: string;
+  target: string;
+  hosts: string[];
+}
+
+interface DeployManifest {
+  app: string;
+  bundles: DeployManifestBundle[];
+}
+
+interface DeployPlanItem {
+  makeTarget: string;
+  deployTag: string;
+  artifactUrl: string;
+  deployBundle: string;
+  deployHosts: string;
+  deployEnv: string;
+  displayName: string;
+}
+
 async function validateRelease(
   repo: string,
   tag: string,
@@ -290,9 +321,16 @@ module.exports = (robot: any) => {
         `Tag: \`${tag}\` | Commit: \`${commitSha.slice(0, 8)}\` | SHA256: \`${fileHash.slice(0, 12)}...\``,
       );
 
-      // Pass the api.github.com asset URL (not the human-facing releaseUrl)
-      // because deploy.sh rejects anything outside api.github.com/repos/sonarmd/*.
-      await runDeploy(msg, robot, identifier, env, tag, assetUrl);
+      const deployPlan = await resolveDeployPlan({
+        identifier,
+        env,
+        tag,
+        artifactUrl: assetUrl,
+        assetPath,
+        stagingDir,
+      });
+
+      await runDeployPlan(msg, robot, identifier, deployPlan);
       cleanup(assetPath, stagingDir);
       return;
     }
@@ -315,37 +353,47 @@ module.exports = (robot: any) => {
     robot.logger.info(`[deploy] fallback | env: ${env} | app: ${identifier} | ${releaseUrl}`);
     msg.send(`:rocket: Deploying \`${repo}\` → \`${env}\` (no structured tag — using latest)`);
 
-    await runDeploy(msg, robot, identifier, env, tag, releaseUrl);
+    await runDeployPlan(msg, robot, identifier, [
+      createDefaultDeployPlanItem(identifier, env, tag, releaseUrl),
+    ]);
   });
 };
 
 // ── Deploy execution ─────────────────────────────────────────────────────────
 
-async function runDeploy(
+async function runDeployPlan(
   msg: any,
   robot: any,
   identifier: string,
-  env: string,
-  tag: string,
-  artifactUrl: string,
+  deployPlan: DeployPlanItem[],
+): Promise<void> {
+  for (const item of deployPlan) {
+    await runDeployItem(msg, robot, identifier, item);
+  }
+}
+
+async function runDeployItem(
+  msg: any,
+  robot: any,
+  identifier: string,
+  planItem: DeployPlanItem,
 ): Promise<void> {
   try {
     // deploy.sh contract (7 positional args — strict):
     //   <caller> <make_target> <deploy_tag> <artifact_url> <deploy_bundle> <deploy_hosts> <deploy_env>
-    //
-    // make_target follows the ${identifier}_${env} convention (e.g. cdk_stg,
-    // api_prd). deploy_bundle and deploy_hosts are unused by the cdk_*
-    // Makefile targets, so we pass empty strings. Non-cdk apps that DO
-    // consume those will need bundle/hosts added to the Slack trigger
-    // contract — out of scope for this fix.
-    const makeTarget = `${identifier}_${env}`;
-    const deployTag  = tag || 'latest';
-    const deployBundle = '';
-    const deployHosts  = '';
+    const {
+      makeTarget,
+      deployTag,
+      artifactUrl,
+      deployBundle,
+      deployHosts,
+      deployEnv,
+      displayName,
+    } = planItem;
 
     // Use execFile-style quoting via shell-escaping so empty positional
     // args survive. Quote every arg defensively.
-    const escape = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+    const escape = shellEscape;
     const cmd = [
       'sudo', '--non-interactive',
       DEPLOY_SCRIPT,
@@ -355,7 +403,7 @@ async function runDeploy(
       escape(artifactUrl),
       escape(deployBundle),
       escape(deployHosts),
-      escape(env),
+      escape(deployEnv),
     ].join(' ');
 
     robot.logger.info(`[deploy] exec: ${cmd}`);
@@ -366,20 +414,185 @@ async function runDeploy(
 
     const recap = extractRecap(stdout);
     msg.send(
-      `:white_check_mark: Deploy SUCCESS — \`${identifier}\` \`${tag || 'latest'}\` → \`${env}\`\n` +
+      `:white_check_mark: Deploy SUCCESS — \`${identifier}\` \`${deployTag || 'latest'}\` → \`${deployEnv}\` (${displayName})\n` +
       `\`\`\`\n${recap}\n\`\`\``,
     );
   } catch (err: any) {
     robot.logger.error(`[deploy] failed: ${err.message}`);
     const tail = (err.stdout ?? '').split('\n').slice(-30).join('\n');
     msg.send(
-      `:x: Deploy FAILED — \`${identifier}\` \`${tag || 'latest'}\` → \`${env}\`\n` +
+      `:x: Deploy FAILED — \`${identifier}\` \`${planItem.deployTag || 'latest'}\` → \`${planItem.deployEnv}\` (${planItem.displayName})\n` +
       `\`\`\`\n${tail || err.stderr || err.message}\n\`\`\``,
     );
   }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+async function resolveDeployPlan(params: {
+  identifier: string;
+  env: string;
+  tag: string;
+  artifactUrl: string;
+  assetPath: string;
+  stagingDir: string;
+}): Promise<DeployPlanItem[]> {
+  const fallbackItem = createDefaultDeployPlanItem(
+    params.identifier,
+    params.env,
+    params.tag,
+    params.artifactUrl,
+  );
+
+  const manifest = await readReleaseManifest(params.assetPath, params.stagingDir);
+  if (manifest) {
+    const manifestPlan = await resolveManifestDeployPlan({
+      env: params.env,
+      tag: params.tag,
+      artifactUrl: params.artifactUrl,
+      stagingDir: params.stagingDir,
+    }, manifest);
+    if (manifestPlan.length > 0) {
+      return manifestPlan;
+    }
+  }
+
+  return [fallbackItem];
+}
+
+function createDefaultDeployPlanItem(
+  identifier: string,
+  env: string,
+  tag: string,
+  artifactUrl: string,
+): DeployPlanItem {
+  return {
+    makeTarget: `${identifier}_${env}`,
+    deployTag: tag || 'latest',
+    artifactUrl,
+    deployBundle: '',
+    deployHosts: '',
+    deployEnv: env,
+    displayName: `${identifier}_${env}`,
+  };
+}
+
+async function resolveManifestDeployPlan(params: {
+  env: string;
+  tag: string;
+  artifactUrl: string;
+  stagingDir: string;
+}, manifest: DeployManifest): Promise<DeployPlanItem[]> {
+  const extractedReleaseDir = path.join(params.stagingDir, 'release');
+  const planItems: DeployPlanItem[] = [];
+
+  for (const bundle of manifest.bundles.filter(requiresPreparedDeployTarget)) {
+    const bundleArchive = path.join(extractedReleaseDir, `${bundle.name}.tar.gz`);
+    if (!existsSync(bundleArchive)) {
+      throw new Error(`Missing bundle archive for ${bundle.name}`);
+    }
+
+    const bundleExtractDir = path.join(params.stagingDir, `bundle-${bundle.name}`);
+    await extractTarball(bundleArchive, bundleExtractDir);
+
+    const bundleRoot = path.join(bundleExtractDir, normalizeBundleRoot(bundle.path));
+
+    for (const host of bundle.hosts) {
+      const deployHost = renderDeployHost(host, params.env);
+      const templateSource = path.join(bundleRoot, `${deployHost}.template.json`);
+      if (!existsSync(templateSource)) {
+        throw new Error(`Missing CDK template for ${deployHost} in ${bundle.name}`);
+      }
+
+      const preparedDir = path.join(DEPLOY_CACHE_BASE, params.tag, deployHost, params.env);
+      mkdirSync(preparedDir, { recursive: true });
+      copyFileSync(templateSource, path.join(preparedDir, `${deployHost}.template.json`));
+
+      planItems.push({
+        makeTarget: `${bundle.target}_${params.env}`,
+        deployTag: params.tag || 'latest',
+        artifactUrl: params.artifactUrl,
+        deployBundle: bundle.name,
+        deployHosts: deployHost,
+        deployEnv: params.env,
+        displayName: `${bundle.name}:${deployHost}`,
+      });
+    }
+  }
+
+  return dedupeDeployPlan(planItems);
+}
+
+async function readReleaseManifest(
+  assetPath: string,
+  stagingDir: string,
+): Promise<DeployManifest | null> {
+  const extractedReleaseDir = path.join(stagingDir, 'release');
+  const manifestPath = path.join(extractedReleaseDir, 'deploy.json');
+
+  if (!existsSync(manifestPath)) {
+    await extractTarball(assetPath, extractedReleaseDir);
+  }
+
+  if (!existsSync(manifestPath)) {
+    return null;
+  }
+
+  return readDeployManifest(manifestPath);
+}
+
+function readDeployManifest(filePath: string): DeployManifest {
+  const manifest = JSON.parse(readFileSync(filePath, 'utf8')) as DeployManifest;
+  if (!Array.isArray(manifest.bundles)) {
+    throw new Error(`Invalid deploy manifest at ${filePath}`);
+  }
+
+  return manifest;
+}
+
+async function extractTarball(archivePath: string, destination: string): Promise<void> {
+  mkdirSync(destination, { recursive: true });
+  await exec(
+    `tar -xzf ${shellEscape(archivePath)} -C ${shellEscape(destination)}`,
+    { timeout: DEPLOY_TIMEOUT },
+  );
+}
+
+function normalizeBundleRoot(bundlePath: string): string {
+  return path.basename(bundlePath.replace(/[\\/]+$/, ''));
+}
+
+function renderDeployHost(host: string, env: string): string {
+  return host.replace(/\{env\}/g, env);
+}
+
+function requiresPreparedDeployTarget(bundle: DeployManifestBundle): boolean {
+  return bundle.target === 'cdk';
+}
+
+function dedupeDeployPlan(items: DeployPlanItem[]): DeployPlanItem[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const key = [
+      item.makeTarget,
+      item.deployTag,
+      item.deployBundle,
+      item.deployHosts,
+      item.deployEnv,
+    ].join('|');
+
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
+function shellEscape(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
 
 function extractRecap(stdout: string): string {
   const lines = stdout.split('\n');
@@ -389,6 +602,7 @@ function extractRecap(stdout: string): string {
 }
 
 const STAGING_BASE = path.join(os.tmpdir(), 'hubot-deploy');
+const DEPLOY_CACHE_BASE = path.join(os.tmpdir(), 'deploy');
 
 function cleanup(file: string, dir: string): void {
   try { unlinkSync(file); } catch { /* already gone */ }
